@@ -15,10 +15,9 @@ from typing import Callable
 import numpy as np
 import torch
 from torch import nn, Tensor
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from tqdm import trange
-
+import math
 # =============================================================================
 # Device Configuration
 # =============================================================================
@@ -65,6 +64,16 @@ def gen_checkerboard(n: int, device: torch.device = DEVICE) -> Tensor:
     pts = pts / 2.0
     return pts + 0.05 * torch.randn(n, 2, device=device)
 
+def gen_swiss_roll(n: int, device: torch.device = DEVICE) -> torch.Tensor:
+    u = torch.rand(n, device=device)
+    t = 0.5 * math.pi + 4.0 * math.pi * u
+    pts = torch.stack([t * torch.cos(t), t * torch.sin(t)], dim=1)
+    pts = pts / (pts.abs().max() + 1e-8)
+    noise = 0.01
+    if noise > 0:
+        pts = pts + noise * torch.randn(pts.shape, device=device)
+    pts = torch.cat([pts, -pts], dim=0)
+    return pts
 # =============================================================================
 # Neural Network
 # =============================================================================
@@ -91,99 +100,62 @@ class Net(nn.Module):
         return self.net(z)
 
 # =============================================================================
-# Drifting Field: Compute V  (Algorithm 2 from paper)
+# Energy Potential and Gradient
 # =============================================================================
-#
-# Mean-shift drifting field (compact form):
-#
-#   V(x) = (1 / (Z_p Z_q)) E_{y+~p, y-~q}[ k(x,y+) k(x,y-) (y+ - y-) ]
-#
-# where k(x,y) = exp(-||x-y|| / tau).
-#
-# Implementation uses doubly-normalized softmax (over both x and y axes)
-# and a factorized weight computation to avoid O(N * N_pos * N_neg) cost.
-#
 
-def compute_drift(
+def mean_shift_energy(
     x: Tensor,
     y_pos: Tensor,
     y_neg: Tensor,
     temp: float = 0.05,
 ) -> Tensor:
-    """
-    Compute the mean-shift drifting field V.
+    """Scalar energy whose gradient matches the mean-shift drift."""
+    if y_pos.requires_grad:
+        y_pos = y_pos.detach()
+    if y_neg.requires_grad:
+        y_neg = y_neg.detach()
 
-    Args:
-        x:     Query points (generated samples) [N, D]
-        y_pos: Positive samples (data) [N_pos, D]
-        y_neg: Negative samples (generated) [N_neg, D]
-        temp:  Kernel temperature
+    dist_pos = torch.cdist(x, y_pos)  # [N, N_pos]
+    dist_neg = torch.cdist(x, y_neg)  # [N, N_neg]
 
-    Returns:
-        V: Drift vectors [N, D]
-    """
-    N, N_pos = x.shape[0], y_pos.shape[0]
+    if x.shape[0] == y_neg.shape[0]:
+        dist_neg = dist_neg + torch.eye(x.shape[0], device=x.device) * 1e6
 
-    # pairwise L2 distances
-    dist_pos = torch.cdist(x, y_pos)                   # [N, N_pos]
-    dist_neg = torch.cdist(x, y_neg)                    # [N, N_neg]
+    energy_pos = -temp * torch.logsumexp(-dist_pos / temp, dim=1)
+    energy_neg = temp * torch.logsumexp(-dist_neg / temp, dim=1)
+    return energy_pos + energy_neg
 
-    # mask self-interactions (y_neg = x in standard usage)
-    if N == y_neg.shape[0]:
-        dist_neg = dist_neg + torch.eye(N, device=x.device) * 1e6
 
-    # logits: -dist / temp
-    logit = torch.cat([
-        -dist_pos / temp,
-        -dist_neg / temp,
-    ], dim=1)                                           # [N, N_pos + N_neg]
+def energy_gradient(
+    x: Tensor,
+    y_pos: Tensor,
+    y_neg: Tensor,
+    temp: float = 0.05,
+) -> Tensor:
+    """Automatic gradient of the energy potential (used for visualization)."""
+    needs_grad = x.requires_grad
+    x_var = x if needs_grad else x.detach().clone()
+    x_var.requires_grad_(True)
 
-    # doubly-normalized affinity: softmax over both dims, geometric mean
-    A_row = logit.softmax(dim=-1)                       # normalize over y
-    A_col = logit.softmax(dim=-2)                       # normalize over x
-    A = (A_row * A_col).sqrt()
+    with torch.enable_grad():
+        energy = mean_shift_energy(x_var, y_pos, y_neg, temp=temp).sum()
+        grad, = torch.autograd.grad(energy, x_var, create_graph=False)
+    return grad if needs_grad else grad.detach()
 
-    # split into positive and negative affinities
-    A_pos = A[:, :N_pos]                                # [N, N_pos]
-    A_neg = A[:, N_pos:]                                # [N, N_neg]
 
-    # factorized weights for compact form:
-    # W_pos[i,j] = A_pos[i,j] * sum_k A_neg[i,k]
-    # W_neg[i,k] = A_neg[i,k] * sum_j A_pos[i,j]
-    W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)
-    W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)
+def energy_loss(gen: Tensor, pos: Tensor, temp: float = 0.05) -> Tensor:
+    """Per-sample energy minimized during training."""
+    return mean_shift_energy(gen, pos, gen, temp=temp)
 
-    # V[i] = sum_j sum_k A_pos[i,j] A_neg[i,k] (y_pos[j] - y_neg[k])
-    V = W_pos @ y_pos - W_neg @ y_neg
 
-    return V
-
-# =============================================================================
-# Drifting Loss  (Algorithm 1 from paper)
-# =============================================================================
-#
-# L = E[ || f(eps) - stopgrad(f(eps) + V(f(eps))) ||^2 ]
-#
-# The loss value equals ||V||^2. Gradients flow only through the prediction
-# f(eps), not through the frozen target f(eps) + V.
-#
-
-def drifting_loss(gen: Tensor, pos: Tensor, temp: float = 0.05) -> Tensor:
-    """
-    Compute per-sample drifting loss.
-
-    Args:
-        gen: Generated samples [N, D] (with gradient)
-        pos: Data (positive) samples [N_pos, D]
-        temp: Kernel temperature
-
-    Returns:
-        Per-sample loss [N] (equals ||V(x)||^2 per sample)
-    """
-    with torch.no_grad():
-        V = compute_drift(gen, pos, gen, temp=temp)
-        target = (gen + V).detach()
-    return ((gen - target) ** 2).sum(dim=-1)
+def drift_from_energy(
+    x: Tensor,
+    y_pos: Tensor,
+    y_neg: Tensor,
+    temp: float = 0.05,
+) -> Tensor:
+    """Convenience helper for visualizing the gradient flow."""
+    return -energy_gradient(x, y_pos, y_neg, temp=temp)
 
 # =============================================================================
 # Drifting Model
@@ -207,19 +179,19 @@ class DriftingModel(nn.Module):
 
     def forward(self, pos: Tensor, n_gen: int | None = None) -> Tensor:
         """
-        Compute per-sample drifting loss.
+        Compute per-sample energy value used for training.
 
         Args:
             pos: Data samples [N_pos, D]
             n_gen: Number of generated samples (defaults to N_pos)
 
         Returns:
-            Per-sample loss [n_gen]
+            Per-sample energy [n_gen]
         """
         n = n_gen or pos.shape[0]
         z = torch.randn(n, self.noise_dim, device=pos.device)
         gen = self.net(z)
-        return drifting_loss(gen, pos, temp=self.temp)
+        return energy_loss(gen, pos, temp=self.temp)
 
     @torch.no_grad()
     def generate(self, n: int) -> Tensor:
@@ -275,7 +247,7 @@ def viz_drift_field(
     plt.legend(fontsize=8)
     plt.axis("scaled")
     plt.grid(True, alpha=0.2)
-    plt.savefig(_get_filename("drift", filename), format="jpg", dpi=150, bbox_inches="tight")
+    plt.savefig(_get_filename("drift_energy", filename), format="jpg", dpi=150, bbox_inches="tight")
     plt.close()
 
 
@@ -299,7 +271,7 @@ def viz_comparison(
     ax2.set_aspect("equal")
     ax2.axis("off")
     plt.tight_layout()
-    plt.savefig(_get_filename("compare", filename), format="jpg", dpi=150, bbox_inches="tight")
+    plt.savefig(_get_filename("compare_energy", filename), format="jpg", dpi=150, bbox_inches="tight")
     plt.close()
 
 # =============================================================================
@@ -342,7 +314,7 @@ def train(
             # drift field visualization
             gen_drift = model.generate(200)
             pos_drift = data_fn(2000)
-            V = compute_drift(gen_drift, pos_drift, gen_drift, temp=model.temp)
+            V = drift_from_energy(gen_drift, pos_drift, gen_drift, temp=model.temp)
             viz_drift_field(gen_drift, pos_drift, V)
 
             model.train()
@@ -363,38 +335,38 @@ if __name__ == "__main__":
     gen_init = torch.randn(150, 2, device=DEVICE) * 2.0
     pos_init = gen_data(2000)
     with torch.no_grad():
-        V_init = compute_drift(gen_init, pos_init, gen_init, temp=0.2)
+        V_init = drift_from_energy(gen_init, pos_init, gen_init, temp=0.2)
     viz_drift_field(gen_init, pos_init, V_init, filename="drift_initial.jpg")
 
     # train on 8 Gaussians
-    print("\n--- Training on 8 Gaussians ---")
-    model = DriftingModel(noise_dim=32, hidden_dim=256, temp=0.05).to(DEVICE)
-    train(model, gen_data, n_iter=5000, batch_size=2048)
+    # print("\n--- Training on 8 Gaussians ---")
+    # model = DriftingModel(noise_dim=32, hidden_dim=256, temp=0.05).to(DEVICE)
+    # train(model, gen_data, n_iter=5000, batch_size=2048)
 
-    # final samples + drift
-    model.eval()
-    gen_final = model.generate(4096)
-    viz_2d_data(gen_final, filename="final_8gaussians.jpg")
+    # # final samples + drift
+    # model.eval()
+    # gen_final = model.generate(4096)
+    # viz_2d_data(gen_final, filename="final_8gaussians.jpg")
 
-    gen_drift = model.generate(200)
-    pos_drift = gen_data(2000)
-    with torch.no_grad():
-        V_final = compute_drift(gen_drift, pos_drift, gen_drift, temp=0.05)
-    viz_drift_field(gen_drift, pos_drift, V_final, filename="drift_final_8gaussians.jpg")
+    # gen_drift = model.generate(200)
+    # pos_drift = gen_data(2000)
+    # with torch.no_grad():
+    #     V_final = drift_from_energy(gen_drift, pos_drift, gen_drift, temp=0.05)
+    # viz_drift_field(gen_drift, pos_drift, V_final, filename="drift_final_8gaussians.jpg")
 
     # train on checkerboard
-    print("\n--- Training on Checkerboard ---")
+    print("\n--- Training on swiss_roll ---")
     model2 = DriftingModel(noise_dim=32, hidden_dim=256, temp=0.05).to(DEVICE)
-    train(model2, gen_checkerboard, n_iter=5000, batch_size=2048)
+    train(model2, gen_swiss_roll, n_iter=50000, batch_size=2048)
 
     model2.eval()
     gen_final2 = model2.generate(4096)
-    viz_2d_data(gen_final2, filename="final_checkerboard.jpg")
+    viz_2d_data(gen_final2, filename="final_swiss_roll_energy.jpg")
 
     gen_drift2 = model2.generate(200)
-    pos_drift2 = gen_checkerboard(2000)
+    pos_drift2 = gen_swiss_roll(2000)
     with torch.no_grad():
-        V_final2 = compute_drift(gen_drift2, pos_drift2, gen_drift2, temp=0.05)
-    viz_drift_field(gen_drift2, pos_drift2, V_final2, filename="drift_final_checkerboard.jpg")
+        V_final2 = drift_from_energy(gen_drift2, pos_drift2, gen_drift2, temp=0.05)
+    viz_drift_field(gen_drift2, pos_drift2, V_final2, filename="drift_final_swiss_roll_energy.jpg")
 
     print("Done.")
